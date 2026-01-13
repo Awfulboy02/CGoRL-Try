@@ -79,7 +79,7 @@ class CGoRLConfig:
     entropy_cost: float = 0.01
     value_loss_coeff: float = 0.25
     clipping_epsilon: float = 0.2
-    max_grad_norm: float = 0.5
+    max_grad_norm: jdc.Static[float] = 0.5
     reward_scaling: float = 1.0
     
     normalize_observations: jdc.Static[bool] = True
