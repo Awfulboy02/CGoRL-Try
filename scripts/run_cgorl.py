@@ -38,7 +38,6 @@ from flow_policy.cgorl import (
     CGoRLEncoderState,
     CGoRLAgent,
     CGoRLRolloutState,
-    rollout_cgorl,
     eval_cgorl_policy,
     collect_data_for_decoder,
 )
@@ -233,6 +232,17 @@ def main(
         
         print(f"\n[Phase 2] Collecting data for decoder training...")
         
+        # 计算合理的收集迭代数
+        # 目标：最多收集 max_samples 个样本
+        max_samples = 10_000_000  # 1000万样本，对齐原代码，足够训练decoder
+        target_iterations = max_samples // config.num_envs
+        actual_iterations = min(
+            data_collection_iterations * config.episode_length,
+            target_iterations
+        )
+        expected_samples = actual_iterations * config.num_envs
+        print(f"  Target iterations: {actual_iterations:,}, Expected samples: {expected_samples:,}")
+        
         prng, collect_prng = jax.random.split(prng)
         obs_data, action_data, reward_data = collect_data_for_decoder(
             agent=agent,
@@ -240,7 +250,7 @@ def main(
             prng=collect_prng,
             num_envs=config.num_envs,
             episode_length=config.episode_length,
-            num_iterations=data_collection_iterations * config.episode_length,
+            num_iterations=actual_iterations,
         )
         
         # Flatten and save
@@ -405,18 +415,24 @@ def _train_encoder_phase1(
     print(f"  Steps per iteration: {steps_per_iter:,}")
     print(f"  Total iterations: {num_iterations:,}")
     
+    # Progress printing frequency
+    print_frequency = max(1, num_iterations // 100)  # Print ~100 times per stage
+    
     for iteration in range(num_iterations):
         current_step = iteration * steps_per_iter
         global_step = cumulative_step + current_step
+        
+        # Progress indicator
+        if iteration % print_frequency == 0 and iteration > 0:
+            progress = iteration / num_iterations * 100
+            print(f"    Progress: {progress:.1f}% ({iteration}/{num_iterations})", flush=True)
         
         # Rollout
         prng, rollout_prng = jax.random.split(prng)
         rollout_state = jdc.replace(rollout_state, prng=rollout_prng)
         
-        rollout_state, transitions = rollout_cgorl(
-            rollout_state=rollout_state,
+        rollout_state, transitions = rollout_state.rollout(
             agent=agent,
-            env=env,
             episode_length=config.episode_length,
             iterations_per_env=config.iterations_per_env,
             deterministic=False,
@@ -495,12 +511,18 @@ def _train_decoder_phase2(
     prng, init_prng = jax.random.split(prng)
     decoder_state = DecoderFMState.init(init_prng, obs_dim, action_dim, config)
     
-    # Update observation statistics
-    obs_stats = RunningStats.init((obs_dim,)).update(obs_data)
+    # Update observation statistics incrementally to save memory
+    obs_stats = RunningStats.init((obs_dim,))
+    num_samples = obs_data.shape[0]
+    stats_batch_size = min(100000, num_samples)  # 分批更新统计量
+    
+    for i in range(0, num_samples, stats_batch_size):
+        end_idx = min(i + stats_batch_size, num_samples)
+        obs_stats = obs_stats.update(obs_data[i:end_idx])
+    
     decoder_state = jdc.replace(decoder_state, obs_stats=obs_stats)
     
     # Training
-    num_samples = obs_data.shape[0]
     num_batches = num_samples // batch_size
     
     print(f"  Samples: {num_samples:,}, Batches: {num_batches}, Epochs: {num_epochs}")
@@ -524,7 +546,7 @@ def _train_decoder_phase2(
             epoch_loss += float(metrics["loss"])
         
         avg_loss = epoch_loss / num_batches
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
+        if epoch % 5 == 0 or epoch == num_epochs - 1:
             print(f"    Epoch {epoch:>3}: loss={avg_loss:.6f}")
     
     return decoder_state

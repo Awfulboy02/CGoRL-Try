@@ -22,7 +22,6 @@ from .cgorl import (
     
     # Rollout
     CGoRLRolloutState,
-    rollout_cgorl,
     eval_cgorl_policy,
     collect_data_for_decoder,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "CGoRLEncoderState",
     "CGoRLAgent",
     "CGoRLRolloutState",
-    "rollout_cgorl",
     "eval_cgorl_policy",
     "collect_data_for_decoder",
 ]

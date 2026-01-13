@@ -646,100 +646,105 @@ class CGoRLAgent:
 @jdc.pytree_dataclass
 class CGoRLRolloutState:
     """Rollout state for C-GoRL."""
+    env: jdc.Static  # mjp.MjxEnv (静态，不参与JIT trace)
     env_state: object  # mjp.State
     first_obs: Array
     first_data: object
     steps: Array
+    num_envs: jdc.Static[int]
     prng: Array
     
     @staticmethod
-    def init(env, prng: Array, num_envs: int):
+    @jdc.jit
+    def init(
+        env: jdc.Static,
+        prng: Array,
+        num_envs: jdc.Static[int],
+    ) -> "CGoRLRolloutState":
         """Initialize rollout state."""
-        prng, reset_prng = jax.random.split(prng)
-        state = jax.vmap(env.reset)(jax.random.split(reset_prng, num_envs))
+        prng, reset_prng = jax.random.split(prng, num=2)
+        state = jax.vmap(env.reset)(jax.random.split(reset_prng, num=num_envs))
         return CGoRLRolloutState(
+            env=env,
             env_state=state,
             first_obs=state.obs,
             first_data=state.data,
             steps=jnp.zeros_like(state.done),
+            num_envs=num_envs,
             prng=prng,
         )
-
-
-def rollout_cgorl(
-    rollout_state: CGoRLRolloutState,
-    agent: CGoRLAgent,
-    env,
-    episode_length: int,
-    iterations_per_env: int,
-    deterministic: bool = False,
-) -> tuple[CGoRLRolloutState, LatentPolicyTransition]:
-    """Perform rollout with C-GoRL agent.
     
-    Key difference from original GoRL: stores ε (not z) in transitions.
-    """
-    
-    def env_step(carry: CGoRLRolloutState, _):
-        state = carry
+    @jdc.jit
+    def rollout(
+        self,
+        agent: CGoRLAgent,
+        episode_length: jdc.Static[int],
+        iterations_per_env: jdc.Static[int],
+        deterministic: jdc.Static[bool] = False,
+    ) -> tuple["CGoRLRolloutState", LatentPolicyTransition]:
+        """Perform rollout with C-GoRL agent."""
         
-        prng_sample, prng_action, prng_next = jax.random.split(state.prng, 3)
+        def env_step(carry: "CGoRLRolloutState", _):
+            state = carry
+            
+            prng_sample, prng_action, prng_next = jax.random.split(state.prng, 3)
+            
+            # Sample action through full pipeline
+            action, eps, eps_info = agent.sample_action(
+                state.env_state.obs, prng_sample, deterministic
+            )
+            
+            # Environment step
+            env_action = jnp.tanh(action)
+            next_env_state = jax.vmap(state.env.step)(state.env_state, env_action)
+            
+            # Episode management
+            next_steps = state.steps + 1
+            truncation = next_steps >= episode_length
+            done_env = next_env_state.done.astype(bool)
+            done_or_tr = jnp.logical_or(done_env, truncation)
+            discount = 1.0 - done_env.astype(jnp.float32)
+            
+            # Store transition (eps, not action!)
+            transition = rollouts.TransitionStruct(
+                obs=state.env_state.obs,
+                next_obs=next_env_state.obs,
+                action=eps,  # Store ε for PPO update
+                action_info=eps_info,
+                reward=next_env_state.reward,
+                truncation=truncation.astype(jnp.float32),
+                discount=discount,
+            )
+            
+            # Auto-reset
+            where_done = lambda x, y: jnp.where(
+                done_or_tr.reshape(done_or_tr.shape + (1,) * (x.ndim - done_or_tr.ndim)),
+                x, y
+            )
+            next_env_state = next_env_state.replace(
+                obs=jax.tree.map(where_done, state.first_obs, next_env_state.obs),
+                data=jax.tree.map(where_done, state.first_data, next_env_state.data),
+                done=jnp.zeros_like(next_env_state.done),
+            )
+            next_steps = jnp.where(done_or_tr, 0, next_steps)
+            
+            new_state = jdc.replace(
+                state,
+                env_state=next_env_state,
+                steps=next_steps,
+                prng=prng_next,
+            )
+            
+            return new_state, transition
         
-        # Sample action through full pipeline
-        action, eps, eps_info = agent.sample_action(
-            state.env_state.obs, prng_sample, deterministic
+        final_state, transitions = jax.lax.scan(
+            env_step,
+            init=self,
+            xs=None,
+            length=iterations_per_env,
         )
         
-        # Environment step
-        env_action = jnp.tanh(action)
-        next_env_state = jax.vmap(env.step)(state.env_state, env_action)
-        
-        # Episode management
-        next_steps = state.steps + 1
-        truncation = next_steps >= episode_length
-        done_env = next_env_state.done.astype(bool)
-        done_or_tr = jnp.logical_or(done_env, truncation)
-        discount = 1.0 - done_env.astype(jnp.float32)
-        
-        # Store transition (eps, not action!)
-        transition = rollouts.TransitionStruct(
-            obs=state.env_state.obs,
-            next_obs=next_env_state.obs,
-            action=eps,  # Store ε for PPO update
-            action_info=eps_info,
-            reward=next_env_state.reward,
-            truncation=truncation.astype(jnp.float32),
-            discount=discount,
-        )
-        
-        # Auto-reset
-        where_done = lambda x, y: jnp.where(
-            done_or_tr.reshape(done_or_tr.shape + (1,) * (x.ndim - done_or_tr.ndim)),
-            x, y
-        )
-        next_env_state = next_env_state.replace(
-            obs=jax.tree.map(where_done, state.first_obs, next_env_state.obs),
-            data=jax.tree.map(where_done, state.first_data, next_env_state.data),
-            done=jnp.zeros_like(next_env_state.done),
-        )
-        next_steps = jnp.where(done_or_tr, 0, next_steps)
-        
-        new_state = jdc.replace(
-            state,
-            env_state=next_env_state,
-            steps=next_steps,
-            prng=prng_next,
-        )
-        
-        return new_state, transition
-    
-    final_state, transitions = jax.lax.scan(
-        env_step,
-        init=rollout_state,
-        xs=None,
-        length=iterations_per_env,
-    )
-    
-    return final_state, transitions
+        return final_state, transitions
 
 
 def eval_cgorl_policy(
@@ -752,10 +757,8 @@ def eval_cgorl_policy(
     """Evaluate C-GoRL policy."""
     rollout_state = CGoRLRolloutState.init(env, prng, num_envs)
     
-    _, transitions = rollout_cgorl(
-        rollout_state,
-        agent,
-        env,
+    _, transitions = rollout_state.rollout(
+        agent=agent,
         episode_length=max_episode_length,
         iterations_per_env=max_episode_length,
         deterministic=True,
@@ -796,10 +799,6 @@ def collect_data_for_decoder(
     """
     rollout_state = CGoRLRolloutState.init(env, prng, num_envs)
     
-    all_obs = []
-    all_actions = []
-    all_rewards = []
-    
     def step_fn(state, _):
         prng_sample, prng_next = jax.random.split(state.prng)
         
@@ -809,7 +808,7 @@ def collect_data_for_decoder(
         )
         
         env_action = jnp.tanh(action)
-        next_env_state = jax.vmap(env.step)(state.env_state, env_action)
+        next_env_state = jax.vmap(state.env.step)(state.env_state, env_action)
         
         # Auto-reset
         done = next_env_state.done.astype(bool)
