@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# GoRL 多卡并行训练脚本
-# 目标: 并行运行 5 个环境，每个环境绑定一张独立显卡
+# C-GoRL 多卡并行训练脚本
+# 目标: 并行运行多个环境，每个环境绑定一张独立显卡
+# 修复: 使用 unbuffered 输出确保日志实时写入
 # ==============================================================================
 
 # 定义配置
@@ -18,7 +19,7 @@ run_env_on_gpu() {
     local gpu_id=$1
     local env_name=$2
     
-    echo ">>> [GPU $gpu_id] 启动任务: $env_name (将在后台顺序运行 5 个种子)"
+    echo ">>> [GPU $gpu_id] 启动任务: $env_name (将顺序运行 ${#SEEDS[@]} 个种子)"
     
     for seed in "${SEEDS[@]}"; do
         timestamp=$(date +%Y%m%d_%H%M%S)
@@ -26,17 +27,24 @@ run_env_on_gpu() {
         
         echo "    [GPU $gpu_id] 开始: $env_name (Seed $seed) -> 日志: $log_file"
         
-        # 核心命令：指定 CUDA_VISIBLE_DEVICES
-        CUDA_VISIBLE_DEVICES=$gpu_id python scripts/run_cgorl.py \
+        # 核心命令：
+        # 1. PYTHONUNBUFFERED=1 - 禁用Python输出缓冲
+        # 2. stdbuf -oL - 行缓冲模式（如果可用）
+        # 3. 2>&1 | tee - 同时输出到终端和文件（可选）
+        CUDA_VISIBLE_DEVICES=$gpu_id \
+        PYTHONUNBUFFERED=1 \
+        python -u scripts/run_cgorl.py \
             --env_name "$env_name" \
             --num_stages $NUM_STAGES \
             --seed $seed \
             > "$log_file" 2>&1
             
-        if [ $? -eq 0 ]; then
-            echo "    [GPU $gpu_id] 完成: $env_name (Seed $seed)"
+        exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            echo "    [GPU $gpu_id] ✓ 完成: $env_name (Seed $seed)"
         else
-            echo "    [GPU $gpu_id] 错误: $env_name (Seed $seed) 失败，请检查日志"
+            echo "    [GPU $gpu_id] ✗ 错误: $env_name (Seed $seed) 失败 (exit code: $exit_code)"
+            echo "    请检查日志: $log_file"
         fi
     done
     
@@ -50,7 +58,8 @@ run_env_on_gpu() {
 # ==============================================================================
 
 # 注意避开忙碌的 GPU
-#ENVS=("CheetahRun" "FingerSpin" "FingerTurnHard" "FishSwim" "HopperStand" "WalkerWalk")
+# 可用环境: CheetahRun, FingerSpin, FingerTurnHard, FishSwim, HopperStand, WalkerWalk
+
 run_env_on_gpu 0 "CheetahRun" &
 run_env_on_gpu 1 "FingerSpin" &
 run_env_on_gpu 5 "FishSwim" &
@@ -59,9 +68,26 @@ run_env_on_gpu 7 "WalkerWalk" &
 
 # ==============================================================================
 
-# 等待所有后台任务结束
-echo "所有任务已在后台启动..."
-echo "你可以使用 'tail -f logs/*.log' 查看实时进度"
-echo "或使用 'nvidia-smi' 查看显卡占用情况"
+echo ""
+echo "=============================================="
+echo "所有任务已在后台启动！"
+echo "=============================================="
+echo ""
+echo "实时查看日志:"
+echo "  tail -f logs/*.log"
+echo ""
+echo "查看特定环境日志:"
+echo "  tail -f logs/CheetahRun*.log"
+echo ""
+echo "查看GPU占用:"
+echo "  watch -n 1 nvidia-smi"
+echo ""
+echo "等待所有任务完成..."
+echo ""
+
 wait
+
+echo ""
+echo "=============================================="
 echo "所有并行任务全部执行完毕！"
+echo "=============================================="

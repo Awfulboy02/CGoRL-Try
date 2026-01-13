@@ -107,15 +107,15 @@ def main(
     obs_dim = env.observation_size
     action_dim = env.action_size
     
-    print(f"\n{'='*60}")
-    print(f"C-GoRL Training - {variant}")
-    print(f"{'='*60}")
-    print(f"Environment: {env_name}")
-    print(f"Obs dim: {obs_dim}, Action dim: {action_dim}")
-    print(f"Stages: {num_stages}, Timesteps: {timesteps_list}")
-    print(f"CURL coeff: {curl_coeff}, KL coeff: {kl_coeff}")
-    print(f"Output: {run_dir}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}", flush=True)
+    print(f"C-GoRL Training - {variant}", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"Environment: {env_name}", flush=True)
+    print(f"Obs dim: {obs_dim}, Action dim: {action_dim}", flush=True)
+    print(f"Stages: {num_stages}, Timesteps: {timesteps_list}", flush=True)
+    print(f"CURL coeff: {curl_coeff}, KL coeff: {kl_coeff}", flush=True)
+    print(f"Output: {run_dir}", flush=True)
+    print(f"{'='*60}\n", flush=True)
     
     # Save config
     config_file = run_dir / "config.txt"
@@ -144,9 +144,9 @@ def main(
     # ==========================================================================
     
     for stage in range(num_stages):
-        print(f"\n{'='*60}")
-        print(f"STAGE {stage}/{num_stages-1}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}", flush=True)
+        print(f"STAGE {stage}/{num_stages-1}", flush=True)
+        print(f"{'='*60}", flush=True)
         
         stage_dir = run_dir / f"stage_{stage}"
         stage_dir.mkdir(parents=True, exist_ok=True)
@@ -159,22 +159,22 @@ def main(
         # ======================================================================
         
         if stage == 0:
-            print("\n[Phase 0] Initializing identity decoder...")
+            print("\n[Phase 0] Initializing identity decoder...", flush=True)
             decoder_state = _init_identity_decoder(
                 stage_prng, obs_dim, action_dim, fm_hidden_size, fm_num_layers
             )
             decoder_checkpoint = stage_dir / "decoder_init.pkl"
             _save_decoder(decoder_state, decoder_checkpoint)
-            print(f"  Saved: {decoder_checkpoint}")
+            print(f"  Saved: {decoder_checkpoint}", flush=True)
         else:
-            print(f"\n[Phase 0] Loading decoder from previous stage...")
+            print(f"\n[Phase 0] Loading decoder from previous stage...", flush=True)
             decoder_state = _load_decoder(decoder_checkpoint)
         
         # ======================================================================
         # Phase 1: Train Encoder (CURL + PPO)
         # ======================================================================
         
-        print(f"\n[Phase 1] Training encoder ({stage_timesteps:,} steps)...")
+        print(f"\n[Phase 1] Training encoder ({stage_timesteps:,} steps)...", flush=True)
         
         # Create config for this stage
         config = CGoRLConfig(
@@ -194,11 +194,11 @@ def main(
         
         # Initialize or load encoder
         if stage == 0 or encoder_checkpoint is None:
-            print("  Initializing encoder from scratch...")
+            print("  Initializing encoder from scratch...", flush=True)
             prng, init_prng = jax.random.split(prng)
             encoder_state = CGoRLEncoderState.init(init_prng, obs_dim, config)
         else:
-            print(f"  Loading encoder from: {encoder_checkpoint}")
+            print(f"  Loading encoder from: {encoder_checkpoint}", flush=True)
             encoder_state = CGoRLEncoderState.load(str(encoder_checkpoint), obs_dim, config)
         
         # Create agent
@@ -224,39 +224,70 @@ def main(
         # Save encoder checkpoint
         encoder_checkpoint = stage_dir / "encoder_checkpoint.pkl"
         agent.encoder_state.save(str(encoder_checkpoint))
-        print(f"  Saved encoder: {encoder_checkpoint}")
+        print(f"  Saved encoder: {encoder_checkpoint}", flush=True)
         
         # ======================================================================
-        # Phase 2: Collect Data
+        # Phase 2: Collect Data (分批收集，带进度监控)
         # ======================================================================
         
-        print(f"\n[Phase 2] Collecting data for decoder training...")
+        print(f"\n[Phase 2] Collecting data for decoder training...", flush=True)
         
         # 计算合理的收集迭代数
         # 目标：最多收集 max_samples 个样本
-        max_samples = 5_000_000  # 500万样本，足够训练decoder
+        max_samples = 5_000_000  # 500万样本，避免显存碎片化问题
         target_iterations = max_samples // config.num_envs
         actual_iterations = min(
             data_collection_iterations * config.episode_length,
             target_iterations
         )
         expected_samples = actual_iterations * config.num_envs
-        print(f"  Target iterations: {actual_iterations:,}, Expected samples: {expected_samples:,}")
+        print(f"  Target iterations: {actual_iterations:,}, Expected samples: {expected_samples:,}", flush=True)
         
-        prng, collect_prng = jax.random.split(prng)
-        obs_data, action_data, reward_data = collect_data_for_decoder(
-            agent=agent,
-            env=env,
-            prng=collect_prng,
-            num_envs=config.num_envs,
-            episode_length=config.episode_length,
-            num_iterations=actual_iterations,
-        )
+        # 分批收集数据，每批收集一定步数后打印进度
+        batch_iterations = 500  # 每批500次迭代 (约100万样本)
+        num_batches = (actual_iterations + batch_iterations - 1) // batch_iterations
         
-        # Flatten and save
-        obs_flat = obs_data.reshape(-1, obs_dim)
-        action_flat = action_data.reshape(-1, action_dim)
+        all_obs = []
+        all_actions = []
+        collected_samples = 0
         
+        print(f"  (分{num_batches}批收集，首批需要JIT编译...)", flush=True)
+        
+        for batch_idx in range(num_batches):
+            # 计算本批次的迭代数
+            start_iter = batch_idx * batch_iterations
+            end_iter = min(start_iter + batch_iterations, actual_iterations)
+            batch_iters = end_iter - start_iter
+            
+            if batch_iters <= 0:
+                break
+            
+            prng, collect_prng = jax.random.split(prng)
+            obs_data, action_data, reward_data = collect_data_for_decoder(
+                agent=agent,
+                env=env,
+                prng=collect_prng,
+                num_envs=config.num_envs,
+                episode_length=config.episode_length,
+                num_iterations=batch_iters,
+            )
+            
+            # 累积数据
+            batch_samples = batch_iters * config.num_envs
+            collected_samples += batch_samples
+            all_obs.append(obs_data.reshape(-1, obs_dim))
+            all_actions.append(action_data.reshape(-1, action_dim))
+            
+            # 打印进度
+            progress = (batch_idx + 1) / num_batches * 100
+            print(f"    Batch {batch_idx + 1}/{num_batches}: "
+                  f"collected {collected_samples:,} samples ({progress:.1f}%)", flush=True)
+        
+        # 合并所有批次数据
+        obs_flat = jnp.concatenate(all_obs, axis=0)
+        action_flat = jnp.concatenate(all_actions, axis=0)
+        
+        # 保存数据
         data_file = stage_dir / "collected_data.pkl"
         with open(data_file, "wb") as f:
             pickle.dump({
@@ -264,13 +295,13 @@ def main(
                 "actions": action_flat,
                 "env_name": env_name,
             }, f)
-        print(f"  Collected {obs_flat.shape[0]:,} samples, saved: {data_file}")
+        print(f"  [Done] Collected {obs_flat.shape[0]:,} samples, saved: {data_file}", flush=True)
         
         # ======================================================================
         # Phase 3: Train Decoder
         # ======================================================================
         
-        print(f"\n[Phase 3] Training decoder...")
+        print(f"\n[Phase 3] Training decoder...", flush=True)
         
         prng, decoder_prng = jax.random.split(prng)
         decoder_state = _train_decoder_phase2(
@@ -289,7 +320,7 @@ def main(
         # Save decoder
         decoder_checkpoint = stage_dir / "decoder_trained.pkl"
         _save_decoder(decoder_state, decoder_checkpoint)
-        print(f"  Saved decoder: {decoder_checkpoint}")
+        print(f"  Saved decoder: {decoder_checkpoint}", flush=True)
         
         # Stage summary
         summary_file = stage_dir / "summary.txt"
@@ -299,18 +330,18 @@ def main(
             f.write(f"Decoder: {decoder_checkpoint}\n")
             f.write(f"Data samples: {obs_flat.shape[0]}\n")
         
-        print(f"\nStage {stage} complete!")
+        print(f"\nStage {stage} complete!", flush=True)
     
     # ==========================================================================
     # Final Summary
     # ==========================================================================
     
-    print(f"\n{'='*60}")
-    print(f"C-GoRL Training Complete!")
-    print(f"{'='*60}")
-    print(f"Output directory: {run_dir}")
-    print(f"Final encoder: {encoder_checkpoint}")
-    print(f"Final decoder: {decoder_checkpoint}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"C-GoRL Training Complete!", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"Output directory: {run_dir}", flush=True)
+    print(f"Final encoder: {encoder_checkpoint}", flush=True)
+    print(f"Final decoder: {decoder_checkpoint}", flush=True)
     
     final_summary = run_dir / "final_summary.txt"
     with open(final_summary, "w") as f:
@@ -412,8 +443,8 @@ def _train_encoder_phase1(
     steps_per_iter = config.iterations_per_env * config.num_envs
     num_iterations = stage_timesteps // steps_per_iter
     
-    print(f"  Steps per iteration: {steps_per_iter:,}")
-    print(f"  Total iterations: {num_iterations:,}")
+    print(f"  Steps per iteration: {steps_per_iter:,}", flush=True)
+    print(f"  Total iterations: {num_iterations:,}", flush=True)
     
     # Progress printing frequency
     print_frequency = max(1, num_iterations // 100)  # Print ~100 times per stage
@@ -455,7 +486,7 @@ def _train_encoder_phase1(
             reward_mean = float(eval_metrics["reward_mean"])
             print(f"  Step {global_step:>10,}: reward={reward_mean:.1f} "
                   f"(curl={float(train_metrics['curl_loss'][-1,-1]):.4f}, "
-                  f"kl={float(train_metrics['kl_loss'][-1,-1]):.4f})")
+                  f"kl={float(train_metrics['kl_loss'][-1,-1]):.4f})", flush=True)
             
             # Log to file
             with open(global_metrics_file, "a") as f:
@@ -525,7 +556,7 @@ def _train_decoder_phase2(
     # Training
     num_batches = num_samples // batch_size
     
-    print(f"  Samples: {num_samples:,}, Batches: {num_batches}, Epochs: {num_epochs}")
+    print(f"  Samples: {num_samples:,}, Batches: {num_batches}, Epochs: {num_epochs}", flush=True)
     
     for epoch in range(num_epochs):
         # Shuffle
@@ -547,7 +578,7 @@ def _train_decoder_phase2(
         
         avg_loss = epoch_loss / num_batches
         if epoch % 2 == 0 or epoch == num_epochs - 1:
-            print(f"    Epoch {epoch:>3}: loss={avg_loss:.6f}")
+            print(f"    Epoch {epoch:>3}: loss={avg_loss:.6f}", flush=True)
     
     return decoder_state
 
