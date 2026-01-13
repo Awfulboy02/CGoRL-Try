@@ -234,7 +234,7 @@ def main(
         
         # 计算合理的收集迭代数
         # 目标：最多收集 max_samples 个样本
-        max_samples = 10_000_000  # 1000万样本，对齐原代码，足够训练decoder
+        max_samples = 5_000_000  # 500万样本，足够训练decoder
         target_iterations = max_samples // config.num_envs
         actual_iterations = min(
             data_collection_iterations * config.episode_length,
@@ -546,7 +546,7 @@ def _train_decoder_phase2(
             epoch_loss += float(metrics["loss"])
         
         avg_loss = epoch_loss / num_batches
-        if epoch % 5 == 0 or epoch == num_epochs - 1:
+        if epoch % 2 == 0 or epoch == num_epochs - 1:
             print(f"    Epoch {epoch:>3}: loss={avg_loss:.6f}")
     
     return decoder_state
