@@ -9,7 +9,7 @@
 # 定义配置
 NUM_STAGES=4
 TIMESTEPS="60000000,60000000,30000000,30000000"
-SEEDS=(1)
+SEEDS=(2 3 4 5)
 
 # 创建日志目录
 mkdir -p logs
