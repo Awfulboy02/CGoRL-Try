@@ -471,8 +471,21 @@ def _train_encoder_phase1(
     steps_per_iter = config.iterations_per_env * config.num_envs
     num_iterations = stage_timesteps // steps_per_iter
     
+    # =========================================================================
+    # 计算评估点（与原GoRL一致的迭代间隔法）
+    # =========================================================================
+    # 每隔 eval_step_interval 次迭代评估一次
+    # 例如: eval_frequency=1M, steps_per_iter=163,840 → 每6次迭代评估一次
+    eval_step_interval = max(1, eval_frequency // steps_per_iter)
+    eval_iters = set(range(0, num_iterations, eval_step_interval))
+    eval_iters.add(num_iterations - 1)  # 确保最后一次迭代也评估
+    
+    # 计算实际评估间隔步数
+    actual_eval_steps = eval_step_interval * steps_per_iter
+    
     print(f"  Steps per iteration: {steps_per_iter:,}", flush=True)
     print(f"  Total iterations: {num_iterations:,}", flush=True)
+    print(f"  Eval every {eval_step_interval} iters (~{actual_eval_steps:,} steps), total {len(eval_iters)} eval points", flush=True)
     
     # Progress printing frequency
     print_frequency = max(1, num_iterations // 100)  # Print ~100 times per stage
@@ -500,8 +513,8 @@ def _train_encoder_phase1(
         # Training step
         agent, train_metrics = agent.training_step(transitions)
         
-        # Evaluation
-        if current_step % eval_frequency == 0 or iteration == num_iterations - 1:
+        # Evaluation (使用预计算的eval_iters集合，与原GoRL一致)
+        if iteration in eval_iters:
             prng, eval_prng = jax.random.split(prng)
             eval_metrics = eval_cgorl_policy(
                 agent=agent,
