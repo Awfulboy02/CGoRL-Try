@@ -9,7 +9,7 @@
 # 定义配置
 NUM_STAGES=4
 TIMESTEPS="60000000,60000000,30000000,30000000"
-SEEDS=(2 3 4 5)
+SEEDS=(1 2 3 4 5)
 
 # 创建日志目录
 mkdir -p logs
@@ -60,11 +60,9 @@ run_env_on_gpu() {
 # 注意避开忙碌的 GPU
 # 可用环境: CheetahRun, FingerSpin, FingerTurnHard, FishSwim, HopperStand, WalkerWalk
 
-run_env_on_gpu 0 "CheetahRun" &
-run_env_on_gpu 1 "FingerSpin" &
-run_env_on_gpu 5 "FishSwim" &
-run_env_on_gpu 6 "HopperStand" &
-run_env_on_gpu 7 "WalkerWalk" &
+
+run_env_on_gpu 1 "FingerTurnHard" &
+
 
 # ==============================================================================
 
