@@ -79,8 +79,8 @@ def main(
     # Data collection
     data_collection_iterations: int = 20,
     
-    # Evaluation
-    eval_frequency: int = 5_000_000,
+    # Evaluation (与原GoRL保持一致的评估频率)
+    eval_frequency: int = 1_000_000,  # 100万步评估一次，与原GoRL一致
     num_eval_envs: int = 128,
     
 ) -> None:
@@ -133,11 +133,20 @@ def main(
     encoder_checkpoint = None
     decoder_checkpoint = None
     global_metrics_file = run_dir / "eval_metrics.txt"
+    all_stage_metrics = {}  # 保存所有Stage的metrics用于画图
     cumulative_step = 0
     
     with open(global_metrics_file, "w") as f:
         f.write(f"C-GoRL Evaluation Metrics ({variant})\n")
-        f.write(f"Environment: {env_name}\n\n")
+        f.write(f"{'='*50}\n")
+        f.write(f"Environment: {env_name}\n")
+        f.write(f"Stages: {num_stages}\n")
+        f.write(f"Timesteps per stage: {timesteps_list}\n")
+        f.write(f"Eval frequency: {eval_frequency}\n")
+        f.write(f"CURL coeff: {curl_coeff}\n")
+        f.write(f"KL coeff: {kl_coeff}\n")
+        f.write(f"Seed: {seed}\n")
+        f.write(f"{'='*50}\n\n")
     
     # ==========================================================================
     # Training Loop
@@ -217,6 +226,7 @@ def main(
             stage_dir=stage_dir,
             global_metrics_file=global_metrics_file,
             cumulative_step=cumulative_step,
+            stage=stage,  # 传入当前Stage编号
         )
         
         cumulative_step += stage_timesteps
@@ -227,14 +237,14 @@ def main(
         print(f"  Saved encoder: {encoder_checkpoint}", flush=True)
         
         # ======================================================================
-        # Phase 2: Collect Data (分批收集，带进度监控)
+        # Phase 2: Collect Data
         # ======================================================================
         
         print(f"\n[Phase 2] Collecting data for decoder training...", flush=True)
         
         # 计算合理的收集迭代数
         # 目标：最多收集 max_samples 个样本
-        max_samples = 5_000_000  # 500万样本，避免显存碎片化问题
+        max_samples = 5_000_000  # 500万样本，足够训练decoder
         target_iterations = max_samples // config.num_envs
         actual_iterations = min(
             data_collection_iterations * config.episode_length,
@@ -243,51 +253,20 @@ def main(
         expected_samples = actual_iterations * config.num_envs
         print(f"  Target iterations: {actual_iterations:,}, Expected samples: {expected_samples:,}", flush=True)
         
-        # 分批收集数据，每批收集一定步数后打印进度
-        batch_iterations = 500  # 每批500次迭代 (约100万样本)
-        num_batches = (actual_iterations + batch_iterations - 1) // batch_iterations
+        prng, collect_prng = jax.random.split(prng)
+        obs_data, action_data, reward_data = collect_data_for_decoder(
+            agent=agent,
+            env=env,
+            prng=collect_prng,
+            num_envs=config.num_envs,
+            episode_length=config.episode_length,
+            num_iterations=actual_iterations,
+        )
         
-        all_obs = []
-        all_actions = []
-        collected_samples = 0
+        # Flatten and save
+        obs_flat = obs_data.reshape(-1, obs_dim)
+        action_flat = action_data.reshape(-1, action_dim)
         
-        print(f"  (分{num_batches}批收集，首批需要JIT编译...)", flush=True)
-        
-        for batch_idx in range(num_batches):
-            # 计算本批次的迭代数
-            start_iter = batch_idx * batch_iterations
-            end_iter = min(start_iter + batch_iterations, actual_iterations)
-            batch_iters = end_iter - start_iter
-            
-            if batch_iters <= 0:
-                break
-            
-            prng, collect_prng = jax.random.split(prng)
-            obs_data, action_data, reward_data = collect_data_for_decoder(
-                agent=agent,
-                env=env,
-                prng=collect_prng,
-                num_envs=config.num_envs,
-                episode_length=config.episode_length,
-                num_iterations=batch_iters,
-            )
-            
-            # 累积数据
-            batch_samples = batch_iters * config.num_envs
-            collected_samples += batch_samples
-            all_obs.append(obs_data.reshape(-1, obs_dim))
-            all_actions.append(action_data.reshape(-1, action_dim))
-            
-            # 打印进度
-            progress = (batch_idx + 1) / num_batches * 100
-            print(f"    Batch {batch_idx + 1}/{num_batches}: "
-                  f"collected {collected_samples:,} samples ({progress:.1f}%)", flush=True)
-        
-        # 合并所有批次数据
-        obs_flat = jnp.concatenate(all_obs, axis=0)
-        action_flat = jnp.concatenate(all_actions, axis=0)
-        
-        # 保存数据
         data_file = stage_dir / "collected_data.pkl"
         with open(data_file, "wb") as f:
             pickle.dump({
@@ -295,7 +274,7 @@ def main(
                 "actions": action_flat,
                 "env_name": env_name,
             }, f)
-        print(f"  [Done] Collected {obs_flat.shape[0]:,} samples, saved: {data_file}", flush=True)
+        print(f"  Collected {obs_flat.shape[0]:,} samples, saved: {data_file}", flush=True)
         
         # ======================================================================
         # Phase 3: Train Decoder
@@ -322,13 +301,30 @@ def main(
         _save_decoder(decoder_state, decoder_checkpoint)
         print(f"  Saved decoder: {decoder_checkpoint}", flush=True)
         
+        # 保存Stage metrics用于画图
+        all_stage_metrics[stage] = stage_metrics["metrics"]
+        
+        # 保存Stage级别的metrics到pickle (用于Figure 6类型的图)
+        stage_metrics_file = stage_dir / "stage_metrics.pkl"
+        with open(stage_metrics_file, "wb") as f:
+            pickle.dump({
+                "stage": stage,
+                "metrics": stage_metrics["metrics"],
+                "best_reward": stage_metrics["best_reward"],
+                "cumulative_step_start": cumulative_step - stage_timesteps,
+                "cumulative_step_end": cumulative_step,
+            }, f)
+        
         # Stage summary
         summary_file = stage_dir / "summary.txt"
         with open(summary_file, "w") as f:
             f.write(f"Stage {stage} Summary\n")
+            f.write(f"{'='*40}\n")
             f.write(f"Encoder: {encoder_checkpoint}\n")
             f.write(f"Decoder: {decoder_checkpoint}\n")
             f.write(f"Data samples: {obs_flat.shape[0]}\n")
+            f.write(f"Best reward: {stage_metrics['best_reward']:.2f}\n")
+            f.write(f"Eval points: {len(stage_metrics['metrics'])}\n")
         
         print(f"\nStage {stage} complete!", flush=True)
     
@@ -343,14 +339,39 @@ def main(
     print(f"Final encoder: {encoder_checkpoint}", flush=True)
     print(f"Final decoder: {decoder_checkpoint}", flush=True)
     
+    # 保存完整的训练metrics到pickle文件 (用于画图)
+    all_metrics_file = run_dir / "all_metrics.pkl"
+    with open(all_metrics_file, "wb") as f:
+        pickle.dump({
+            "env_name": env_name,
+            "variant": variant,
+            "num_stages": num_stages,
+            "timesteps_per_stage": timesteps_list,
+            "total_timesteps": cumulative_step,
+            "curl_coeff": curl_coeff,
+            "kl_coeff": kl_coeff,
+            "seed": seed,
+            "eval_frequency": eval_frequency,
+            "stage_metrics": all_stage_metrics,  # 按Stage组织的metrics
+        }, f)
+    print(f"Saved all metrics: {all_metrics_file}", flush=True)
+    
     final_summary = run_dir / "final_summary.txt"
     with open(final_summary, "w") as f:
         f.write(f"C-GoRL Final Summary ({variant})\n")
+        f.write(f"{'='*50}\n")
         f.write(f"Environment: {env_name}\n")
         f.write(f"Stages completed: {num_stages}\n")
         f.write(f"Total timesteps: {cumulative_step:,}\n")
+        f.write(f"Eval frequency: {eval_frequency:,}\n")
+        f.write(f"Total eval points: {sum(len(m) for m in all_stage_metrics.values())}\n")
         f.write(f"Final encoder: {encoder_checkpoint}\n")
         f.write(f"Final decoder: {decoder_checkpoint}\n")
+        f.write(f"\nPer-stage best rewards:\n")
+        for s, metrics in all_stage_metrics.items():
+            if metrics:
+                best = max(m["reward_mean"] for m in metrics)
+                f.write(f"  Stage {s}: {best:.2f}\n")
 
 
 # =============================================================================
@@ -428,8 +449,15 @@ def _train_encoder_phase1(
     stage_dir: Path,
     global_metrics_file: Path,
     cumulative_step: int,
+    stage: int,  # 新增：当前Stage编号
 ) -> tuple[CGoRLAgent, dict]:
     """Phase 1: Train encoder with CURL + PPO."""
+    
+    # 在Stage开始时写入标记
+    with open(global_metrics_file, "a") as f:
+        f.write(f"\n{'='*50}\n")
+        f.write(f"STAGE {stage}\n")
+        f.write(f"{'='*50}\n\n")
     
     # Initialize rollout state
     prng, rollout_prng = jax.random.split(prng)
@@ -483,23 +511,47 @@ def _train_encoder_phase1(
                 max_episode_length=config.episode_length,
             )
             
+            # Extract metrics
             reward_mean = float(eval_metrics["reward_mean"])
-            print(f"  Step {global_step:>10,}: reward={reward_mean:.1f} "
+            reward_std = float(eval_metrics["reward_std"])
+            reward_min = float(eval_metrics["reward_min"])
+            reward_max = float(eval_metrics["reward_max"])
+            steps_mean = float(eval_metrics["steps_mean"])
+            steps_std = float(eval_metrics["steps_std"])
+            steps_min = float(eval_metrics["steps_min"])
+            steps_max = float(eval_metrics["steps_max"])
+            
+            # Console output
+            print(f"  Step {global_step:>10,}: reward={reward_mean:.1f}±{reward_std:.1f} "
                   f"(curl={float(train_metrics['curl_loss'][-1,-1]):.4f}, "
                   f"kl={float(train_metrics['kl_loss'][-1,-1]):.4f})", flush=True)
             
-            # Log to file
+            # Log to file (格式与原GoRL兼容)
             with open(global_metrics_file, "a") as f:
                 f.write(f"Step: {global_step}\n")
-                f.write(f"Reward: {reward_mean:.2f}\n")
-                f.write(f"CURL Loss: {float(train_metrics['curl_loss'][-1,-1]):.6f}\n")
-                f.write(f"KL Loss: {float(train_metrics['kl_loss'][-1,-1]):.6f}\n")
-                f.write(f"Policy Loss: {float(train_metrics['policy_loss'][-1,-1]):.6f}\n")
-                f.write(f"Entropy: {float(train_metrics['entropy'][-1,-1]):.4f}\n")
-                f.write(f"Eps Mean: {float(train_metrics['eps_mean'][-1,-1]):.4f}\n")
-                f.write(f"Eps Std: {float(train_metrics['eps_std'][-1,-1]):.4f}\n")
-                f.write(f"Z_s Mean: {float(train_metrics['z_s_mean'][-1,-1]):.4f}\n")
-                f.write(f"Z_s Std: {float(train_metrics['z_s_std'][-1,-1]):.4f}\n")
+                f.write(f"-" * 50 + "\n")
+                # Reward metrics (核心指标，用于画图)
+                f.write(f"reward_mean: {reward_mean:.4f}\n")
+                f.write(f"reward_std: {reward_std:.4f}\n")
+                f.write(f"reward_min: {reward_min:.4f}\n")
+                f.write(f"reward_max: {reward_max:.4f}\n")
+                # Steps metrics
+                f.write(f"steps_mean: {steps_mean:.4f}\n")
+                f.write(f"steps_std: {steps_std:.4f}\n")
+                f.write(f"steps_min: {steps_min:.4f}\n")
+                f.write(f"steps_max: {steps_max:.4f}\n")
+                # C-GoRL specific metrics (CURL相关)
+                f.write(f"curl_loss: {float(train_metrics['curl_loss'][-1,-1]):.6f}\n")
+                f.write(f"kl_loss: {float(train_metrics['kl_loss'][-1,-1]):.6f}\n")
+                # PPO metrics
+                f.write(f"policy_loss: {float(train_metrics['policy_loss'][-1,-1]):.6f}\n")
+                f.write(f"value_loss: {float(train_metrics['value_loss'][-1,-1]):.6f}\n")
+                f.write(f"entropy: {float(train_metrics['entropy'][-1,-1]):.4f}\n")
+                # Latent space statistics
+                f.write(f"eps_mean: {float(train_metrics['eps_mean'][-1,-1]):.4f}\n")
+                f.write(f"eps_std: {float(train_metrics['eps_std'][-1,-1]):.4f}\n")
+                f.write(f"z_s_mean: {float(train_metrics['z_s_mean'][-1,-1]):.4f}\n")
+                f.write(f"z_s_std: {float(train_metrics['z_s_std'][-1,-1]):.4f}\n")
                 f.write("\n")
             
             # Save best
@@ -510,7 +562,12 @@ def _train_encoder_phase1(
             
             all_metrics.append({
                 "step": global_step,
-                "reward": reward_mean,
+                "local_step": current_step,  # 用于Figure 6类型的图
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "reward_min": reward_min,
+                "reward_max": reward_max,
+                "steps_mean": steps_mean,
                 **{k: float(v[-1,-1]) for k, v in train_metrics.items()},
             })
     

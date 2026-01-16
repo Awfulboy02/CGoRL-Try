@@ -754,7 +754,11 @@ def eval_cgorl_policy(
     num_envs: int,
     max_episode_length: int,
 ) -> dict[str, Array]:
-    """Evaluate C-GoRL policy."""
+    """Evaluate C-GoRL policy.
+    
+    Returns a dictionary with comprehensive evaluation metrics matching
+    the original GoRL format for fair comparison and plotting.
+    """
     rollout_state = CGoRLRolloutState.init(env, prng, num_envs)
     
     _, transitions = rollout_state.rollout(
@@ -765,16 +769,25 @@ def eval_cgorl_policy(
     )
     
     # Compute metrics
-    rewards = jnp.sum(transitions.reward, axis=0)
+    rewards = jnp.sum(transitions.reward, axis=0)  # (num_envs,)
     valid_mask = transitions.discount > 0.0
-    steps = jnp.sum(valid_mask, axis=0)
+    steps = jnp.sum(valid_mask, axis=0)  # (num_envs,)
     
+    # Comprehensive metrics matching original GoRL
     return {
+        # Reward statistics
         "reward_mean": jnp.mean(rewards),
         "reward_std": jnp.std(rewards),
         "reward_min": jnp.min(rewards),
         "reward_max": jnp.max(rewards),
+        # Steps statistics  
         "steps_mean": jnp.mean(steps),
+        "steps_std": jnp.std(steps),
+        "steps_min": jnp.min(steps),
+        "steps_max": jnp.max(steps),
+        # Raw data for histogram plotting
+        "rewards_raw": rewards,
+        "steps_raw": steps,
     }
 
 
