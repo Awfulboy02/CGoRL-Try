@@ -25,3 +25,7 @@ logs/
 *.log
 
 *.sh
+
+# visualization
+all_plots/
+visualize_cgorl.py
