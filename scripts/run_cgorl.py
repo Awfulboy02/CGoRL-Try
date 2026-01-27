@@ -57,11 +57,21 @@ def main(
     
     # C-GoRL specific
     curl_coeff: float = 1.0,         # λ1: CURL loss weight
-    kl_coeff: float = 0.001,         # λ2: KL loss weight (0 for Variant 2)
+    kl_coeff: float = 0.001,         # λ2: KL loss weight (0 for Variant 2/3)
     curl_latent_dim: int = 50,       # CURL representation dimension
     curl_momentum: float = 0.95,     # EMA momentum
     curl_temperature: float = 0.1,   # InfoNCE temperature
     augmentation_scale: float = 0.01,# State augmentation noise
+    
+    # =========================================================================
+    # 改进方案参数 (C-GoRL v2)
+    # =========================================================================
+    # 方案A: Policy Head Reset - 在Stage切换时重置策略头，恢复高熵探索
+    reset_policy_head: bool = False,  # 是否在Stage切换时重置Policy网络
+    
+    # 方案B: Tanh Squashing - 硬性分布约束，消除OOD问题
+    use_tanh_squashing: bool = False, # 是否启用tanh约束
+    latent_scale: float = 3.0,        # tanh输出的缩放系数
     
     # PPO parameters
     learning_rate: float = 1e-3,
@@ -84,11 +94,30 @@ def main(
     num_eval_envs: int = 128,
     
 ) -> None:
-    """Run C-GoRL training pipeline."""
+    """Run C-GoRL training pipeline.
+    
+    改进版本支持:
+    - 方案A (reset_policy_head): Stage切换时重置Policy头，解决探索僵化
+    - 方案B (use_tanh_squashing): Tanh约束潜空间，解决分布失配和震荡
+    """
     
     # Setup
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    variant = "v1_weakKL" if kl_coeff > 0 else "v2_noKL"
+    
+    # 构建variant名称，反映所有配置选项
+    variant_parts = []
+    if use_tanh_squashing:
+        variant_parts.append("tanh")
+    elif kl_coeff > 0:
+        variant_parts.append("weakKL")
+    else:
+        variant_parts.append("noKL")
+    
+    if reset_policy_head:
+        variant_parts.append("resetHead")
+    
+    variant = "_".join(variant_parts)
+    
     run_id = f"cgorl_{variant}_{env_name}_seed{seed}_{timestamp}"
     run_dir = Path("results") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +143,11 @@ def main(
     print(f"Obs dim: {obs_dim}, Action dim: {action_dim}", flush=True)
     print(f"Stages: {num_stages}, Timesteps: {timesteps_list}", flush=True)
     print(f"CURL coeff: {curl_coeff}, KL coeff: {kl_coeff}", flush=True)
+    # 打印改进方案配置
+    if use_tanh_squashing:
+        print(f"[改进B] Tanh Squashing: enabled (scale={latent_scale})", flush=True)
+    if reset_policy_head:
+        print(f"[改进A] Policy Head Reset: enabled", flush=True)
     print(f"Output: {run_dir}", flush=True)
     print(f"{'='*60}\n", flush=True)
     
@@ -121,6 +155,7 @@ def main(
     config_file = run_dir / "config.txt"
     with open(config_file, "w") as f:
         f.write(f"C-GoRL Configuration ({variant})\n")
+        f.write(f"{'='*50}\n")
         f.write(f"Environment: {env_name}\n")
         f.write(f"Stages: {num_stages}\n")
         f.write(f"Timesteps: {timesteps_list}\n")
@@ -128,6 +163,10 @@ def main(
         f.write(f"KL coeff: {kl_coeff}\n")
         f.write(f"CURL latent dim: {curl_latent_dim}\n")
         f.write(f"Learning rate: {learning_rate}\n")
+        f.write(f"\n--- 改进方案配置 ---\n")
+        f.write(f"Policy Head Reset: {reset_policy_head}\n")
+        f.write(f"Tanh Squashing: {use_tanh_squashing}\n")
+        f.write(f"Latent Scale: {latent_scale}\n")
     
     # Initialize tracking
     encoder_checkpoint = None
@@ -199,6 +238,9 @@ def main(
             max_grad_norm=max_grad_norm,
             entropy_cost=entropy_cost,
             num_timesteps=stage_timesteps,
+            # 改进方案B: Tanh Squashing
+            use_tanh_squashing=use_tanh_squashing,
+            latent_scale=latent_scale,
         )
         
         # Initialize or load encoder
@@ -209,6 +251,17 @@ def main(
         else:
             print(f"  Loading encoder from: {encoder_checkpoint}", flush=True)
             encoder_state = CGoRLEncoderState.load(str(encoder_checkpoint), obs_dim, config)
+            
+            # ================================================================
+            # 改进方案A: Policy Head Reset
+            # 在Stage切换时重置Policy网络，保留CURL Encoder
+            # ================================================================
+            if reset_policy_head:
+                print("  [Policy Head Reset] Resetting policy network for new stage exploration...", flush=True)
+                prng, reset_prng = jax.random.split(prng)
+                encoder_state = encoder_state.reset_policy_head(reset_prng)
+                print("    - CURL encoder: preserved", flush=True)
+                print("    - Policy head: reset to high-entropy state", flush=True)
         
         # Create agent
         agent = CGoRLAgent(encoder_state=encoder_state, decoder_state=decoder_state)

@@ -45,6 +45,7 @@ class CGoRLConfig:
     
     Variant 1 (CURL + weak KL): kl_coeff > 0 (e.g., 0.001)
     Variant 2 (CURL + no KL):   kl_coeff = 0
+    Variant 3 (Tanh squashing): use_tanh_squashing = True, kl_coeff = 0
     """
     # Environment
     action_repeat: jdc.Static[int] = 1
@@ -64,7 +65,12 @@ class CGoRLConfig:
     augmentation_scale: float = 0.01  # Gaussian noise for state augmentation
     
     # KL regularization (Variant 1 vs Variant 2)
-    kl_coeff: float = 0.001  # λ2: KL loss coefficient (0 for Variant 2)
+    kl_coeff: float = 0.001  # λ2: KL loss coefficient (0 for Variant 2/3)
+    
+    # Tanh squashing for latent space (Variant 3 - 改进方案B)
+    # 当启用时，ε_final = latent_scale * tanh(ε_raw)，确保decoder输入有界
+    use_tanh_squashing: jdc.Static[bool] = False  # 是否启用tanh约束
+    latent_scale: float = 3.0  # tanh输出的缩放系数，覆盖N(0,1)的主要置信区间
     
     # PPO parameters (from original encoder_ppo.py)
     batch_size: jdc.Static[int] = 256
@@ -316,6 +322,47 @@ class CGoRLEncoderState:
         with open(path, "wb") as f:
             pickle.dump(checkpoint, f)
     
+    def reset_policy_head(self, prng: Array) -> "CGoRLEncoderState":
+        """Reset policy head while preserving CURL encoder and obs_stats.
+        
+        This implements the "Policy Head Reset" strategy (改进方案A):
+        - 保留: curl_state (CURL encoder参数) 和 obs_stats
+        - 重置: policy_params (Actor和Critic网络)
+        
+        用于Stage切换时恢复高熵探索状态，避免"继承陷阱"。
+        
+        Args:
+            prng: Random key for re-initialization
+            
+        Returns:
+            New CGoRLEncoderState with reset policy head
+        """
+        prng1, prng2, prng3 = jax.random.split(prng, 3)
+        
+        # Re-initialize policy networks (Actor and Critic)
+        # Actor: z_s → (μ, σ) for ε
+        new_actor = mlp_init(
+            prng1, (self.config.curl_latent_dim, 32, 32, 32, 32, self.config.z_dim * 2)
+        )
+        # Critic: z_s → V(s)
+        new_critic = mlp_init(
+            prng2, (self.config.curl_latent_dim, 256, 256, 256, 256, 256, 1)
+        )
+        
+        new_policy_params = LatentPolicyParams(new_actor, new_critic)
+        
+        # Re-initialize optimizer state for new parameters
+        all_params = _pack_params(self.curl_state, new_policy_params)
+        new_opt_state = self.opt.init(all_params)
+        
+        return jdc.replace(
+            self,
+            policy_params=new_policy_params,
+            opt_state=new_opt_state,
+            prng=prng3,
+            steps=jnp.zeros((), dtype=jnp.int32),  # Reset step counter
+        )
+    
     def sample_epsilon(
         self, obs: Array, prng: Array, deterministic: bool
     ) -> tuple[Array, LatentPolicyActionInfo]:
@@ -543,11 +590,18 @@ class CGoRLEncoderState:
         )
         metrics["kl_loss"] = kl_loss
         
-        # Log latent statistics
+        # Log latent statistics (raw epsilon from policy network)
         metrics["eps_mean"] = jnp.mean(eps_dist.loc)
         metrics["eps_std"] = jnp.mean(eps_dist.scale)
         metrics["z_s_mean"] = jnp.mean(z_s)
         metrics["z_s_std"] = jnp.std(z_s)
+        
+        # Log squashed epsilon statistics (if tanh squashing is enabled)
+        if config.use_tanh_squashing:
+            # 计算squashed后的epsilon统计
+            squashed_mean = config.latent_scale * jnp.tanh(eps_dist.loc)
+            metrics["eps_squashed_mean"] = jnp.mean(squashed_mean)
+            metrics["eps_squashed_abs_max"] = jnp.max(jnp.abs(squashed_mean))
         
         # =====================================================================
         # Total Loss
@@ -557,7 +611,7 @@ class CGoRLEncoderState:
             value_loss + 
             entropy_loss + 
             config.curl_coeff * curl_loss +
-            kl_loss  # 0 for Variant 2
+            kl_loss  # 0 for Variant 2/3
         )
         metrics["total_loss"] = total_loss
         
@@ -601,7 +655,7 @@ class CGoRLAgent:
     """Complete C-GoRL agent with CURL encoder and FM decoder.
     
     Inference path:
-        obs → CURL(obs) → z_s → π_θ(ε|z_s) → ε → g_φ(obs, ε) → action
+        obs → CURL(obs) → z_s → π_θ(ε|z_s) → ε → [tanh squash] → g_φ(obs, ε) → action
     """
     encoder_state: CGoRLEncoderState
     decoder_state: DecoderFMState
@@ -609,12 +663,30 @@ class CGoRLAgent:
     def sample_epsilon(
         self, obs: Array, prng: Array, deterministic: bool
     ) -> tuple[Array, LatentPolicyActionInfo]:
-        """Sample ε from encoder."""
+        """Sample ε from encoder (returns raw ε, not squashed)."""
         return self.encoder_state.sample_epsilon(obs, prng, deterministic)
     
+    def _squash_epsilon(self, eps: Array) -> Array:
+        """Apply tanh squashing to epsilon if enabled.
+        
+        This implements the "Tanh Latent" constraint (改进方案B):
+        ε_final = latent_scale * tanh(ε_raw)
+        
+        确保decoder输入始终在有界空间[-latent_scale, latent_scale]内，
+        从根本上消除OOD问题。
+        """
+        config = self.encoder_state.config
+        if config.use_tanh_squashing:
+            return config.latent_scale * jnp.tanh(eps)
+        return eps
+    
     def map_epsilon_to_action(self, obs: Array, eps: Array, prng: Array) -> Array:
-        """Map ε to action using decoder."""
-        return self.decoder_state.sample_action_from_z(obs, eps, prng, deterministic=True)
+        """Map ε to action using decoder.
+        
+        Note: eps is squashed before passing to decoder if tanh_squashing is enabled.
+        """
+        eps_for_decoder = self._squash_epsilon(eps)
+        return self.decoder_state.sample_action_from_z(obs, eps_for_decoder, prng, deterministic=True)
     
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
@@ -622,9 +694,14 @@ class CGoRLAgent:
         """Full inference: obs → action.
         
         Returns:
-            action: Final action
-            eps: Sampled ε (for storing in transitions)
-            info: Action info with log_prob
+            action: Final action from decoder
+            eps: Raw sampled ε (for storing in transitions, used in PPO update)
+            info: Action info with log_prob (computed on raw eps)
+            
+        Note: 
+            - PPO的log_prob基于raw_eps计算（因为这是策略网络的直接输出）
+            - Decoder接收squashed_eps（如果启用了tanh_squashing）
+            - Transitions存储raw_eps（用于PPO更新时计算importance ratio）
         """
         prng1, prng2 = jax.random.split(prng)
         eps, info = self.sample_epsilon(obs, prng1, deterministic)
