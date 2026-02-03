@@ -11,6 +11,7 @@ dist/
 results/
 *.pkl
 data/
+experiment_records/
 
 # IDE
 .idea/
